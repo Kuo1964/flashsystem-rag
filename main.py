@@ -231,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── query ──
     p_query = subparsers.add_parser("query", help="互動式兩階段查詢")
     _add_common_args(p_query)
-    p_query.add_argument("--top-k",      default=8,    type=int, help="第一層搜尋的候選段落數")
+    p_query.add_argument("--top-k",      default=30,   type=int, help="第一層搜尋的候選段落數")
     p_query.add_argument("--version",    default=None,           help="篩選特定版本，例如 9.1.3")
     p_query.add_argument("--source-type",default=None,           help="篩選來源類型：pdf / web / json_cli")
     p_query.set_defaults(func=cmd_query)
@@ -240,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search = subparsers.add_parser("search", help="單次兩階段查詢")
     _add_common_args(p_search)
     p_search.add_argument("question",                          help="查詢問題")
-    p_search.add_argument("--top-k",      default=8,    type=int, help="第一層搜尋的候選段落數")
+    p_search.add_argument("--top-k",      default=30,   type=int, help="第一層搜尋的候選段落數")
     p_search.add_argument("--version",    default=None,           help="篩選特定版本，例如 9.1.3")
     p_search.add_argument("--source-type",default=None,           help="篩選來源類型：pdf / web / json_cli 等")
     p_search.set_defaults(func=cmd_search)

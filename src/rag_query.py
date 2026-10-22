@@ -74,6 +74,7 @@ _SOURCE_PRIORITY: Dict[str, int] = {
 
 # context 最大字元數（防止超過 LLM token 上限）
 _MAX_CONTEXT_CHARS = 6000   # 保留更多 output budget 給 LLM（原本 8000 會吃掉太多 token）
+_MODEL_BOOST_K     = 5      # 型號強制補入時，額外用 metadata filter 搜尋的 chunk 數
 
 
 def _score_chunk(doc: Document) -> float:
@@ -95,18 +96,83 @@ def _deduplicate(docs: List[Document], threshold: int = 100) -> List[Document]:
     return list(seen.values())
 
 
+# 從問題中抽取型號編號（4 位數），對應到可能的文件 source 檔名前綴
+# 支援以下格式：FS7600、fs7600、FlashSystem 7600、FS 7600、7600（緊接中文時無 \b）
+_BOOST_MODEL_RE = re.compile(
+    r"(?:(?:flash\s*system\s*|fs\s*)(\d{4})(?:\b|(?=\s|$|[\u4e00-\u9fff]))"
+    r"|(?<!\d)(\d{4})(?=\s*(?:節點|node|每個|電源|PSU|power)))",
+    re.IGNORECASE,
+)
+
+
+def _boost_model_docs(
+    question: str,
+    vectorstore: Chroma,
+    existing_docs: List[Document],
+    boost_k: int = 5,
+    where_filter: Optional[Dict[str, Any]] = None,
+) -> List[Document]:
+    """
+    若問題中出現型號關鍵字（如 fs7600），以 metadata source filter 直接
+    搜尋該型號文件，將結果補入 existing_docs 前端，確保相關文件一定被納入。
+
+    這解決了 embedding 語意偏移問題：
+    - 向量搜尋基於語意相似度，當型號間硬體描述用詞相近時（power supply、
+      cabling 等），高版本多版本的 FS9200 文件會佔據前排，壓低 FS7600 排名。
+    - 強制補入確保「問到哪個型號，就一定有那個型號的文件」。
+    """
+    # findall 回傳 list of tuples（因為有多個 group），取每個 tuple 中第一個非空的值
+    raw_matches = _BOOST_MODEL_RE.findall(question)
+    model_nums = {next((g for g in groups if g), None) for groups in raw_matches}
+    model_nums.discard(None)
+    if not model_nums:
+        return existing_docs
+
+    boosted: List[Document] = list(existing_docs)
+    existing_keys = {doc.page_content[:100].strip() for doc in existing_docs}
+
+    for model_num in model_nums:
+        # 對應的 source 檔名模式，例如 7600 → "fs7600"
+        source_pattern = f"fs{model_num}"
+
+        # 用 metadata where filter 直接指定 source 檔名
+        boost_filter: Dict[str, Any] = {"source": {"$eq": f"{source_pattern}_pdfguide.pdf"}}
+        # 若使用者有額外的 where 條件（如 version），合併進去
+        if where_filter:
+            boost_filter = {"$and": [boost_filter, where_filter]}
+
+        try:
+            boost_docs = vectorstore.similarity_search(
+                question,
+                k=boost_k,
+                filter=boost_filter,
+            )
+            for doc in boost_docs:
+                key = doc.page_content[:100].strip()
+                if key not in existing_keys:
+                    existing_keys.add(key)
+                    boosted.insert(0, doc)   # 插入最前面，確保不被 context 截斷
+        except Exception:
+            # filter 不符合（例如該型號無文件）時靜默忽略
+            pass
+
+    return boosted
+
+
 class LocalRAGFilter:
     """
     第一層：本機向量搜尋 + 品質過濾。
     完全在本機執行，不呼叫任何外部 API。
     """
 
-    def __init__(self, vectorstore: Chroma, top_k: int = 8):
+    def __init__(self, vectorstore: Chroma, top_k: int = 30):
         """
         Args:
             vectorstore: 已載入的 Chroma 向量資料庫。
             top_k:       初始搜尋取得的候選段落數（過濾前）。
                          過濾後實際使用的段落數會少於此值。
+                         預設從 8 提高至 30：fs7600 的 PSU 相關 chunk
+                         在向量相似度排名約第 98 位，需要更大的搜尋範圍。
         """
         self.vectorstore = vectorstore
         self.top_k = top_k
@@ -137,7 +203,7 @@ class LocalRAGFilter:
 
         search_kwargs: Dict[str, Any] = {
             "k": self.top_k,
-            "fetch_k": self.top_k * 4,
+            "fetch_k": self.top_k * 8,   # 原本 4x 不足，提高至 8x 增加多樣性
         }
         if where:
             search_kwargs["filter"] = where
@@ -147,13 +213,22 @@ class LocalRAGFilter:
             search_kwargs=search_kwargs,
         ).invoke(question)
 
-        # ── 2. 去重 ──
+        # ── 2. 型號強制補入（問題含型號關鍵字時，確保該型號文件一定進入候選）──
+        raw_docs = _boost_model_docs(
+            question=question,
+            vectorstore=self.vectorstore,
+            existing_docs=raw_docs,
+            boost_k=_MODEL_BOOST_K,
+            where_filter=where if where else None,
+        )
+
+        # ── 3. 去重 ──
         deduped = _deduplicate(raw_docs)
 
-        # ── 3. 依 source_type 優先分數排序 ──
+        # ── 4. 依 source_type 優先分數排序 ──
         ranked = sorted(deduped, key=_score_chunk, reverse=True)
 
-        # ── 4. 截斷到 context 上限 ──
+        # ── 5. 截斷到 context 上限 ──
         selected: List[Document] = []
         total_chars = 0
         for doc in ranked:
@@ -163,7 +238,7 @@ class LocalRAGFilter:
             selected.append(doc)
             total_chars += length
 
-        # ── 5. 組合 context 文字 ──
+        # ── 6. 組合 context 文字 ──
         context_parts = []
         for i, doc in enumerate(selected, 1):
             src  = doc.metadata.get("source", "unknown")
@@ -178,7 +253,7 @@ class LocalRAGFilter:
 
         context_text = "\n\n---\n\n".join(context_parts)
 
-        # ── 6. 引用來源列表 ──
+        # ── 7. 引用來源列表 ──
         source_refs = []
         seen_src: set = set()
         for i, doc in enumerate(selected, 1):
@@ -195,7 +270,7 @@ class LocalRAGFilter:
                     ref += f"  p.{pg}"
                 source_refs.append(ref)
 
-        # ── 7. 型號不符警告偵測 ──
+        # ── 8. 型號不符警告偵測 ──
         # 從問題中抽取型號關鍵字，並與實際引用的文件來源比對
         mismatch_warning = _detect_model_mismatch(question, selected)
 
@@ -219,12 +294,6 @@ _MODEL_KEYWORDS: Dict[str, List[str]] = {
     "9000": ["fs9000", "flashsystem 9000", "9200", "9500"],
 }
 
-_MODEL_PATTERN = re.compile(
-    r"\b(?:flash\s*system\s*)?(?:fs)?(\d{4})\b",
-    re.IGNORECASE,
-)
-
-
 def _detect_model_mismatch(question: str, docs: List[Document]) -> str:
     """
     若問題中提及特定型號，但檢索回來的文件來源都是其他型號，
@@ -233,12 +302,12 @@ def _detect_model_mismatch(question: str, docs: List[Document]) -> str:
     if not docs:
         return ""
 
-    # 從問題中找出詢問的型號
-    q_matches = _MODEL_PATTERN.findall(question)
-    if not q_matches:
+    # 從問題中找出詢問的型號（重用 _BOOST_MODEL_RE，支援中文邊界）
+    raw_matches = _BOOST_MODEL_RE.findall(question)
+    queried_models = {next((g for g in groups if g), None) for groups in raw_matches}
+    queried_models.discard(None)
+    if not queried_models:
         return ""
-
-    queried_models = {m for m in q_matches}  # e.g. {"7600"}
 
     # 收集文件來源字串（source 檔名 + page_content 前 100 字）
     doc_texts = []
