@@ -1,0 +1,29 @@
+# 環境與機密
+.env
+apikey.json
+
+# 虛擬環境
+.venv/
+
+# Python 編譯檔
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 向量資料庫（體積大，本機產生）
+vectorstore/
+
+# 日誌
+logs/
+
+# 大型原始資料（PDF、爬取快取）
+*.pdf
+*.jsonl
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

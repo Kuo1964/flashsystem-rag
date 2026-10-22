@@ -1,0 +1,617 @@
+"""
+rag_query.py
+============
+兩階段 FlashSystem 專家系統。
+
+第一層（本機 RAG 過濾）：
+  - 向量相似度搜尋，從 Chroma 取得候選段落
+  - 本機評分：去重、相關性篩選、依 source_type 優先排序
+  - 輸出：精煉後的 Context 與引用清單
+
+第二層（LLM 深度推理）：
+  - 將第一層的 Context 連同原始問題送給 LLM
+  - 使用結構化 Prompt 要求輸出：診斷 / 操作步驟 / 風險提示 / 引用來源
+  - 輸出：ExpertAnswer（結構化 dataclass）
+  - 支援 LLM 供應商：watsonx（預設）、gemini
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain_chroma import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ibm import WatsonxLLM
+
+load_dotenv()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 資料結構
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FilterResult:
+    """第一層過濾的輸出。"""
+    question: str
+    chunks: List[Document]          # 篩選後的相關段落（已去重排序）
+    context_text: str               # 組合成字串的 context，供第二層使用
+    source_refs: List[str]          # 引用來源列表
+    model_mismatch_warning: str = ""  # 若查詢型號與文件型號不符時的警告訊息
+
+
+@dataclass
+class ExpertAnswer:
+    """第二層推理的輸出。"""
+    question: str
+    diagnosis: str                  # 問題診斷／背景說明
+    steps: List[str]                # 操作步驟或解答要點
+    risks: List[str]                # 風險提示或注意事項
+    summary: str                    # 總結
+    sources: List[str]              # 引用來源
+    raw_llm_output: str             # LLM 原始輸出（供 debug）
+    filter_result: FilterResult     # 保留第一層結果供查閱
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 第一層：本機 RAG 過濾器
+# ─────────────────────────────────────────────────────────────────────────────
+
+# source_type 優先權（分數越高越優先放在 context 前面）
+_SOURCE_PRIORITY: Dict[str, int] = {
+    "json_cli":      10,   # CLI 指令白名單：最精確
+    "json_feature":  9,    # 功能生命週期：版本判斷關鍵
+    "json_parts":    8,    # 零件清單：硬體相關
+    "pdf":           5,    # PDF 手冊：詳細但較長
+    "web":           4,    # IBM Docs 網頁：廣泛但可能重複
+}
+
+# context 最大字元數（防止超過 LLM token 上限）
+_MAX_CONTEXT_CHARS = 6000   # 保留更多 output budget 給 LLM（原本 8000 會吃掉太多 token）
+
+
+def _score_chunk(doc: Document) -> float:
+    """給每個 chunk 計算優先分數，分數越高越優先。"""
+    src_type = doc.metadata.get("source_type", "unknown")
+    return float(_SOURCE_PRIORITY.get(src_type, 1))
+
+
+def _deduplicate(docs: List[Document], threshold: int = 100) -> List[Document]:
+    """
+    移除內容高度重複的段落（頭100字相同即視為重複）。
+    保留分數較高的那一個。
+    """
+    seen: Dict[str, Document] = {}
+    for doc in docs:
+        key = doc.page_content[:threshold].strip()
+        if key not in seen:
+            seen[key] = doc
+    return list(seen.values())
+
+
+class LocalRAGFilter:
+    """
+    第一層：本機向量搜尋 + 品質過濾。
+    完全在本機執行，不呼叫任何外部 API。
+    """
+
+    def __init__(self, vectorstore: Chroma, top_k: int = 8):
+        """
+        Args:
+            vectorstore: 已載入的 Chroma 向量資料庫。
+            top_k:       初始搜尋取得的候選段落數（過濾前）。
+                         過濾後實際使用的段落數會少於此值。
+        """
+        self.vectorstore = vectorstore
+        self.top_k = top_k
+
+    def filter(
+        self,
+        question: str,
+        version: Optional[str] = None,
+        source_type: Optional[str] = None,
+    ) -> FilterResult:
+        """
+        執行本機 RAG 過濾。
+
+        Args:
+            question:    使用者問題。
+            version:     版本篩選（例如 "9.1.3"）。
+            source_type: 來源類型篩選（"pdf" / "web" / "json_cli" 等）。
+
+        Returns:
+            FilterResult：包含篩選後段落、context 文字、引用來源。
+        """
+        # ── 1. 向量搜尋（MMR 保證多樣性）──
+        where: Dict[str, Any] = {}
+        if version:
+            where["version"] = {"$eq": version}
+        if source_type:
+            where["source_type"] = {"$eq": source_type}
+
+        search_kwargs: Dict[str, Any] = {
+            "k": self.top_k,
+            "fetch_k": self.top_k * 4,
+        }
+        if where:
+            search_kwargs["filter"] = where
+
+        raw_docs = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs=search_kwargs,
+        ).invoke(question)
+
+        # ── 2. 去重 ──
+        deduped = _deduplicate(raw_docs)
+
+        # ── 3. 依 source_type 優先分數排序 ──
+        ranked = sorted(deduped, key=_score_chunk, reverse=True)
+
+        # ── 4. 截斷到 context 上限 ──
+        selected: List[Document] = []
+        total_chars = 0
+        for doc in ranked:
+            length = len(doc.page_content)
+            if total_chars + length > _MAX_CONTEXT_CHARS:
+                break
+            selected.append(doc)
+            total_chars += length
+
+        # ── 5. 組合 context 文字 ──
+        context_parts = []
+        for i, doc in enumerate(selected, 1):
+            src  = doc.metadata.get("source", "unknown")
+            ver  = doc.metadata.get("version", "")
+            pg   = doc.metadata.get("page", "")
+            label = f"[{i}] {src}"
+            if ver:
+                label += f" ({ver})"
+            if pg:
+                label += f" p.{pg}"
+            context_parts.append(f"{label}\n{doc.page_content}")
+
+        context_text = "\n\n---\n\n".join(context_parts)
+
+        # ── 6. 引用來源列表 ──
+        source_refs = []
+        seen_src: set = set()
+        for i, doc in enumerate(selected, 1):
+            src = doc.metadata.get("source", "unknown")
+            ver = doc.metadata.get("version", "")
+            pg  = doc.metadata.get("page", "")
+            key = (src, pg)
+            if key not in seen_src:
+                seen_src.add(key)
+                ref = f"[{i}] {src}"
+                if ver:
+                    ref += f"  version={ver}"
+                if pg:
+                    ref += f"  p.{pg}"
+                source_refs.append(ref)
+
+        # ── 7. 型號不符警告偵測 ──
+        # 從問題中抽取型號關鍵字，並與實際引用的文件來源比對
+        mismatch_warning = _detect_model_mismatch(question, selected)
+
+        return FilterResult(
+            question=question,
+            chunks=selected,
+            context_text=context_text,
+            source_refs=source_refs,
+            model_mismatch_warning=mismatch_warning,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 型號不符偵測
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FlashSystem 型號關鍵字對應（型號縮寫 → 文件關鍵字）
+_MODEL_KEYWORDS: Dict[str, List[str]] = {
+    "5000": ["fs5000", "flashsystem 5000", "5200", "5035", "5015"],
+    "7000": ["fs7000", "flashsystem 7000", "7200", "7600"],
+    "9000": ["fs9000", "flashsystem 9000", "9200", "9500"],
+}
+
+_MODEL_PATTERN = re.compile(
+    r"\b(?:flash\s*system\s*)?(?:fs)?(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_model_mismatch(question: str, docs: List[Document]) -> str:
+    """
+    若問題中提及特定型號，但檢索回來的文件來源都是其他型號，
+    則回傳警告字串；否則回傳空字串。
+    """
+    if not docs:
+        return ""
+
+    # 從問題中找出詢問的型號
+    q_matches = _MODEL_PATTERN.findall(question)
+    if not q_matches:
+        return ""
+
+    queried_models = {m for m in q_matches}  # e.g. {"7600"}
+
+    # 收集文件來源字串（source 檔名 + page_content 前 100 字）
+    doc_texts = []
+    for doc in docs:
+        src = doc.metadata.get("source", "").lower()
+        doc_texts.append(src)
+        doc_texts.append(doc.page_content[:100].lower())
+    combined = " ".join(doc_texts)
+
+    # 判斷查詢型號系列是否有出現在文件來源中
+    missing: List[str] = []
+    found_families: set = set()
+    for model_num in queried_models:
+        # 找到這個型號屬於哪個系列
+        for family, keywords in _MODEL_KEYWORDS.items():
+            if any(model_num in kw for kw in keywords):
+                # 檢查文件來源是否包含同系列任一關鍵字
+                if not any(kw in combined for kw in keywords):
+                    if family not in found_families:
+                        missing.append(f"FS{model_num}")
+                        found_families.add(family)
+                break
+
+    if missing:
+        missing_str = "、".join(missing)
+        return (
+            f"⚠ 知識庫中找不到 {missing_str} 的專屬文件，"
+            f"以下回答是根據相近型號的文件推斷，可能存在差異。"
+            f"建議將 {missing_str} 的 Hardware Installation Guide 加入知識庫後重建索引。"
+        )
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 第二層：watsonx 深度推理
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EXPERT_PROMPT_TEMPLATE = """\
+你是一位精通 IBM FlashSystem 儲存系統的專家工程師。
+
+以下是從 IBM FlashSystem 官方文件（PDF 手冊、IBM Docs 網頁、技術白名單）中檢索到的參考段落，以及使用者的問題。
+
+請根據參考資料，以**繁體中文**撰寫詳盡的結構化專家回答。
+
+== 參考資料 ==
+{context}
+
+== 使用者問題 ==
+{question}
+
+== 回答格式要求 ==
+請嚴格依照以下格式輸出，不可新增或刪除任何段落標籤。所有內容必須使用繁體中文。
+
+[DIAGNOSIS]
+<說明使用者的問題核心，以及涉及哪些 FlashSystem 概念或元件。>
+
+[STEPS]
+<具體的操作步驟、指令或解答，以編號列表呈現。若無步驟請填「不適用」。>
+1.
+2.
+3.
+
+[RISKS]
+<使用者必須注意的風險、警告或前提條件，以項目符號列表呈現。若無風險請填「無」。>
+-
+
+[SUMMARY]
+<用一段話簡潔地總結完整回答。>
+
+[SOURCES]
+<列出本回答引用的參考資料編號，例如 [1]、[3]。>
+"""
+
+_EXPERT_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=_EXPERT_PROMPT_TEMPLATE,
+)
+
+# 逐 section 切割：找到每個標籤的起始位置，取兩標籤之間的文字
+_TAG_RE = re.compile(r"\[(DIAGNOSIS|STEPS|RISKS|SUMMARY|SOURCES)\]", re.IGNORECASE)
+
+
+def _extract_sections(raw: str) -> dict:
+    """將 LLM 輸出按 [TAG] 切割成 {tag: content} dict，容許前言文字與標籤大小寫變化。"""
+    sections: dict = {}
+    matches = list(_TAG_RE.finditer(raw))
+    for i, m in enumerate(matches):
+        tag = m.group(1).upper()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        sections[tag] = raw[start:end].strip()
+    return sections
+
+
+def _parse_expert_output(raw: str, question: str, filter_result: FilterResult) -> ExpertAnswer:
+    """將 LLM 的結構化文字輸出解析成 ExpertAnswer。"""
+    sections = _extract_sections(raw)
+
+    # 至少要有 DIAGNOSIS 或 SUMMARY 才算成功解析
+    if not sections or ("DIAGNOSIS" not in sections and "SUMMARY" not in sections):
+        # 嘗試把截斷的原始輸出直接當 diagnosis 顯示，而非空白
+        return ExpertAnswer(
+            question=question,
+            diagnosis=raw.strip() if raw.strip() else "（LLM 未回傳任何內容）",
+            steps=[],
+            risks=[],
+            summary="（輸出格式解析失敗，請參閱上方診斷欄位的原始 LLM 輸出）",
+            sources=filter_result.source_refs,
+            raw_llm_output=raw,
+            filter_result=filter_result,
+        )
+
+    diagnosis   = sections.get("DIAGNOSIS", "")
+    steps_raw   = sections.get("STEPS", "")
+    risks_raw   = sections.get("RISKS", "")
+    summary     = sections.get("SUMMARY", "")
+
+    # 解析 steps：取出編號列表（相容中英文數字、全形句號）
+    steps = [
+        re.sub(r"^[\d１-９]+[.．、\s]+", "", line).strip()
+        for line in steps_raw.splitlines()
+        if re.match(r"^[\d１-９]+[.．、]", line.strip())
+    ]
+    # 若編號解析失敗但有內容，直接按行保留
+    if not steps and steps_raw:
+        steps = [line.strip() for line in steps_raw.splitlines() if line.strip()]
+
+    # 解析 risks：取出 bullet 列表
+    risks = [
+        line.lstrip("-•*－ ").strip()
+        for line in risks_raw.splitlines()
+        if line.strip() and line.strip()[0] in "-•*－"
+    ]
+    # 若 bullet 解析失敗但有內容，直接按行保留
+    if not risks and risks_raw and risks_raw not in ("無", "None", "N/A"):
+        risks = [line.strip() for line in risks_raw.splitlines() if line.strip()]
+
+    # sources：使用第一層檢索到的 source_refs
+    sources = filter_result.source_refs
+
+    return ExpertAnswer(
+        question=question,
+        diagnosis=diagnosis,
+        steps=steps,
+        risks=risks,
+        summary=summary,
+        sources=sources,
+        raw_llm_output=raw,
+        filter_result=filter_result,
+    )
+
+
+def _build_watsonx_llm(
+    model_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    url: Optional[str] = None,
+) -> WatsonxLLM:
+    resolved_model   = model_id   or os.environ.get("WATSONX_MODEL_ID",   "ibm/granite-13b-chat-v2")
+    resolved_project = project_id or os.environ.get("WATSONX_PROJECT_ID", "")
+    resolved_api_key = api_key    or os.environ.get("WATSONX_APIKEY",     "")
+    resolved_url     = url        or os.environ.get("WATSONX_URL",        "https://us-south.ml.cloud.ibm.com")
+
+    if not resolved_api_key:
+        raise ValueError("缺少 WATSONX_APIKEY。請在 .env 檔案中設定。")
+    if not resolved_project:
+        raise ValueError("缺少 WATSONX_PROJECT_ID。請在 .env 檔案中設定。")
+
+    return WatsonxLLM(
+        model_id=resolved_model,
+        url=resolved_url,
+        project_id=resolved_project,
+        apikey=resolved_api_key,
+        params={
+            "decoding_method": "greedy",
+            "max_new_tokens": 2048,
+            "min_new_tokens": 1,
+            "temperature": 0.05,
+            "top_k": 50,
+            "top_p": 1,
+            "repetition_penalty": 1.05,
+        },
+    )
+
+
+def _build_gemini_llm(
+    model_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> ChatGoogleGenerativeAI:
+    resolved_model   = model_id or os.environ.get("GEMINI_MODEL_ID", "gemini-2.0-flash")
+    resolved_api_key = api_key  or os.environ.get("GEMINI_API_KEY",  "")
+
+    if not resolved_api_key:
+        raise ValueError("缺少 GEMINI_API_KEY。請在 .env 檔案中設定。")
+
+    return ChatGoogleGenerativeAI(
+        model=resolved_model,
+        google_api_key=resolved_api_key,
+        temperature=0.05,
+        max_output_tokens=8192,   # 原本 2048 不足以容納繁體中文完整回答，提高至 8192
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 主介面：FlashSystemExpert（兩階段）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FlashSystemExpert:
+    """
+    IBM FlashSystem 兩階段專家系統。
+
+    使用方式：
+        expert = FlashSystemExpert(vectorstore)
+        answer = expert.ask("How do I configure iSCSI on FlashSystem 9500?")
+        print(expert.format_answer(answer))
+    """
+
+    def __init__(
+        self,
+        vectorstore: Chroma,
+        top_k: int = 8,
+        llm_provider: str = "watsonx",
+        model_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+        watsonx_url: Optional[str] = None,
+        verbose: bool = False,
+    ):
+        """
+        Args:
+            vectorstore:  已載入的 Chroma 向量資料庫。
+            top_k:        第一層搜尋的候選段落數（過濾前）。
+            llm_provider: LLM 供應商："watsonx"（預設）或 "gemini"。
+            model_id:     模型 ID（watsonx 或 Gemini，可覆寫 .env）。
+            project_id:   watsonx Project ID（僅 watsonx 使用）。
+            api_key:      API Key（watsonx 使用 IBM Cloud Key；gemini 使用 Google AI Key）。
+            watsonx_url:  watsonx endpoint URL（僅 watsonx 使用）。
+            verbose:      True 時印出第一層的中間結果。
+        """
+        self.local_filter = LocalRAGFilter(vectorstore, top_k=top_k)
+        if llm_provider == "gemini":
+            self.llm = _build_gemini_llm(model_id, api_key)
+        else:
+            self.llm = _build_watsonx_llm(model_id, project_id, api_key, watsonx_url)
+        self.verbose = verbose
+
+    def ask(
+        self,
+        question: str,
+        version: Optional[str] = None,
+        source_type: Optional[str] = None,
+    ) -> ExpertAnswer:
+        """
+        執行兩階段查詢。
+
+        Args:
+            question:    使用者問題。
+            version:     版本篩選（例如 "9.1.3"）。
+            source_type: 來源類型篩選。
+
+        Returns:
+            ExpertAnswer：結構化的完整專家回答。
+        """
+        # ── 第一層：本機 RAG 過濾 ──
+        print("  [第一層] 本機向量搜尋與過濾中...", flush=True)
+        filter_result = self.local_filter.filter(question, version, source_type)
+
+        if self.verbose:
+            print(f"  [第一層] 找到 {len(filter_result.chunks)} 個相關段落：")
+            for ref in filter_result.source_refs:
+                print(f"           {ref}")
+
+        if not filter_result.chunks:
+            return ExpertAnswer(
+                question=question,
+                diagnosis="本機知識庫中找不到相關資訊。",
+                steps=[],
+                risks=[],
+                summary="請確認問題是否與 IBM FlashSystem 相關，或嘗試重建向量資料庫。",
+                sources=[],
+                raw_llm_output="",
+                filter_result=filter_result,
+            )
+
+        # ── 第二層：watsonx 深度推理 ──
+        print("  [第二層] 送往 IBM watsonx 進行深度推理...", flush=True)
+        prompt = _EXPERT_PROMPT.format(
+            context=filter_result.context_text,
+            question=question,
+        )
+        raw_output = self.llm.invoke(prompt)
+        # Chat models (Gemini, etc.) return AIMessage; extract plain text
+        if hasattr(raw_output, "content"):
+            raw_output = raw_output.content
+
+        return _parse_expert_output(raw_output, question, filter_result)
+
+    def format_answer(self, answer: ExpertAnswer, verbose: bool = False) -> str:
+        """將 ExpertAnswer 格式化成易讀的終端輸出。"""
+        sep = "─" * 60
+        lines = [
+            "",
+            sep,
+            f"  問題：{answer.question}",
+            sep,
+        ]
+
+        # 型號不符警告（優先顯示在最上方）
+        if answer.filter_result.model_mismatch_warning:
+            lines += ["", answer.filter_result.model_mismatch_warning]
+
+        lines += [
+            "",
+            "【診斷】",
+            answer.diagnosis,
+        ]
+
+        if answer.steps:
+            lines += ["", "【操作步驟】"]
+            for i, step in enumerate(answer.steps, 1):
+                lines.append(f"  {i}. {step}")
+        else:
+            lines += ["", "【操作步驟】", "  N/A"]
+
+        if answer.risks and answer.risks != ["None"]:
+            lines += ["", "【風險與注意事項】"]
+            for risk in answer.risks:
+                if risk:
+                    lines.append(f"  ⚠  {risk}")
+        else:
+            lines += ["", "【風險與注意事項】", "  無"]
+
+        lines += [
+            "",
+            "【總結】",
+            answer.summary,
+        ]
+
+        if answer.sources:
+            lines += ["", "【引用來源】"]
+            for src in answer.sources:
+                lines.append(f"  {src}")
+
+        if verbose and answer.raw_llm_output:
+            lines += [
+                "",
+                "── LLM 原始輸出（debug）──",
+                answer.raw_llm_output,
+            ]
+
+        lines.append(sep)
+        return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+    from src.build_vectorstore import load_vectorstore
+
+    persist_dir     = sys.argv[1] if len(sys.argv) > 1 else "/Volumes/SSD_4TB/RAG/vectorstore"
+    collection_name = sys.argv[2] if len(sys.argv) > 2 else "flashsystem_all"
+
+    vs     = load_vectorstore(persist_dir, collection_name)
+    expert = FlashSystemExpert(vs, verbose=True)
+
+    print("IBM FlashSystem 專家系統（兩階段）\n輸入 'exit' 退出。\n")
+    while True:
+        try:
+            q = input("問題：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再見！")
+            break
+        if q.lower() in ("exit", "quit", "q", ""):
+            continue
+        ans = expert.ask(q)
+        print(expert.format_answer(ans))
