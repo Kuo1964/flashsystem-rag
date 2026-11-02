@@ -104,9 +104,44 @@ python main.py search "What is the maximum drive count?" --source-type pdf
 
 ### 調整 Embedding 模型
 
-在 [`src/build_vectorstore.py`](src/build_vectorstore.py) 中修改 `DEFAULT_EMBED_MODEL`：
-- `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`（預設，多語言）
-- `sentence-transformers/all-MiniLM-L6-v2`（英文，速度較快）
+預設模型由環境變數 `RAG_EMBED_MODEL` 決定（見 [`src/build_vectorstore.py`](src/build_vectorstore.py)），**必須與向量庫建立時相同**：
+- `BAAI/bge-m3`（新建庫預設，多語言，支援 8192 token，不會截斷 1000 字元的段落）
+- `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`（舊庫；最大輸入僅 128 token，約 92% 的段落後半段不會被向量化）
+
+換模型 **不需要重新爬取**：用 [`scripts/migrate_embeddings.py`](scripts/migrate_embeddings.py) 讀取舊 collection 的文字重新向量化，寫到另一個目錄（可續傳）：
+
+```bash
+.venv/bin/python3 scripts/migrate_embeddings.py --dst-dir /Users/yhkuo/RAG/vectorstore_bge --device mps
+```
+
+完成後把 `.env` 的 `RAG_VECTOR_DIR` 指向新目錄、`RAG_EMBED_MODEL` 改成 `BAAI/bge-m3`。
+
+### 同頁前後文展開
+
+第一層命中的 web／pdf 段落，會自動帶入同一頁（網址或 PDF 頁碼）前後相鄰的段落，同頁多個命中合併成一筆，重疊部分去重。
+- `RAG_NEIGHBOR_WINDOW`：向前後各展開幾個段落（預設 1；0 = 關閉）
+- `RAG_MAX_CONTEXT_CHARS`：送給 LLM 的 context 字元上限（預設 9000）
+
+### 修復抓到導覽骨架的網頁
+
+IBM Docs 是單頁應用，爬取當下偶爾拿到尚未渲染完成的頁面。舊版爬蟲在找不到主文時會退回整個 `body`，
+把 `Documentation / My IBM / Log in …` 的導覽殼寫進向量庫（約 27% 的網頁受影響，錯誤訊息頁居多）。
+
+- 爬蟲已修正：[`_fetch_text`](src/ingest_web.py) 找不到主文時會多等、重載，仍失敗就放棄且不記錄為已完成。
+- 既有的壞頁用 [`scripts/refetch_bad_pages.py`](scripts/refetch_bad_pages.py) 修復（可中斷續跑）：
+
+```bash
+.venv/bin/python3 scripts/refetch_bad_pages.py --list-only                 # 只統計壞頁數
+.venv/bin/python3 scripts/refetch_bad_pages.py --workers 3 --purge-unfetchable
+```
+
+`--purge-unfetchable`：重抓後仍沒有主文的頁（如版本首頁）會刪除其骨架 chunk，不再當成內容。
+執行期間不可同時有爬蟲或遷移在寫同一個向量庫。
+
+### 錯誤碼／指令名精確比對
+
+問題含 `CMMVC5770E` 這類錯誤碼或 `lssystem` 這類 CLI 指令名時，會依網址的 topic 名稱直接取回對應頁面
+（向量檢索分不出相近的識別碼）。`RAG_EXACT_PAGES_PER_ID` 控制每個識別碼取回的頁數（預設 4，新版本優先）。
 
 ### 調整段落切割參數
 
@@ -133,5 +168,5 @@ python main.py build --chunk-size 800 --chunk-overlap 100
 
 - 網頁爬取預設每個根網址最多 200 個子頁面（`--max-web-pages` 可調整）
 - 爬取間隔 0.3 秒（`ingest_web.py` 中 `delay` 參數），避免對 IBM Docs 造成負擔
-- 向量資料庫儲存於 `/Volumes/SSD_4TB/RAG/vectorstore`，可在 `.env` 中修改 `RAG_VECTOR_DIR`
+- 向量資料庫儲存於 `/Users/yhkuo/RAG/vectorstore`，可在 `.env` 中修改 `RAG_VECTOR_DIR`
 - 不要將 `.env` 提交至版本控制（`.gitignore` 已排除）

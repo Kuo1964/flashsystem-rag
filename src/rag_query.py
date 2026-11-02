@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,8 +75,16 @@ _SOURCE_PRIORITY: Dict[str, int] = {
 }
 
 # context 最大字元數（防止超過 LLM token 上限）
-_MAX_CONTEXT_CHARS = 6000   # 保留更多 output budget 給 LLM（原本 8000 會吃掉太多 token）
+# 命中段落會展開成「同頁前後文」，單筆變長，因此上限由 6000 提高到 9000
+_MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "9000"))
 _MODEL_BOOST_K     = 5      # 型號強制補入時，額外用 metadata filter 搜尋的 chunk 數
+
+# 命中段落向前後各展開幾個同頁相鄰段落（0 = 不展開）
+_NEIGHBOR_WINDOW = int(os.environ.get("RAG_NEIGHBOR_WINDOW", "1"))
+# 只展開這些來源（JSON 本身已是完整條目，不需展開）
+_EXPAND_SOURCE_TYPES = {"web", "pdf"}
+# 相鄰段落重疊的偵測範圍（字元）；切割時 overlap=150
+_OVERLAP_MIN, _OVERLAP_MAX = 20, 300
 
 
 def _score_chunk(doc: Document) -> float:
@@ -94,6 +104,220 @@ def _deduplicate(docs: List[Document], threshold: int = 100) -> List[Document]:
         if key not in seen:
             seen[key] = doc
     return list(seen.values())
+
+
+def _join_chunks(a: str, b: str) -> str:
+    """接合兩個相鄰段落：若 a 的結尾與 b 的開頭重疊（切割時的 overlap）則去掉重疊部分。"""
+    for k in range(min(len(a), len(b), _OVERLAP_MAX), _OVERLAP_MIN - 1, -1):
+        if a.endswith(b[:k]):
+            return a + b[k:]
+    return a + "\n" + b
+
+
+def _page_where(doc: Document) -> Optional[Dict[str, Any]]:
+    """取得「同一頁」的 metadata 過濾條件；web 以網址為一頁，pdf 以 檔名+頁碼 為一頁。"""
+    src = doc.metadata.get("source")
+    if not src:
+        return None
+    if doc.metadata.get("source_type") == "pdf":
+        page = doc.metadata.get("page")
+        if page is None:
+            return None
+        return {"$and": [{"source": {"$eq": src}}, {"page": {"$eq": page}}]}
+    return {"source": {"$eq": src}}
+
+
+def _expand_with_neighbors(
+    docs: List[Document],
+    vectorstore: Chroma,
+    window: int = _NEIGHBOR_WINDOW,
+) -> List[Document]:
+    """
+    將命中的 chunk 展開成「同頁前後文」。
+
+    - 同一頁有多個 chunk 命中時合併成一筆，排在第一個命中者的位置。
+    - 每個命中 chunk 向前後各取 window 個同頁相鄰 chunk；不連續的區段以 "..." 分隔。
+    - 相鄰 chunk 的 overlap 會去重。
+    - 找不到同頁資料或查詢失敗時，原樣保留該 chunk。
+    """
+    if window <= 0:
+        return docs
+
+    groups: Dict[str, Dict[str, Any]] = {}   # key → {"first": Document, "texts": set}
+    order: List[Any] = []                    # 保持原排序；元素為 key 或原 Document
+    for doc in docs:
+        where = _page_where(doc) if doc.metadata.get("source_type") in _EXPAND_SOURCE_TYPES else None
+        if where is None:
+            order.append(doc)
+            continue
+        key = repr(where)
+        if key not in groups:
+            groups[key] = {"first": doc, "where": where, "hits": []}
+            order.append(key)
+        groups[key]["hits"].append(doc.page_content)
+
+    result: List[Document] = []
+    for item in order:
+        if isinstance(item, Document):
+            result.append(item)
+            continue
+        g = groups[item]
+        first: Document = g["first"]
+        try:
+            page_chunks: List[str] = vectorstore._collection.get(
+                where=g["where"], include=["documents"]
+            )["documents"]
+        except Exception:
+            result.extend(Document(page_content=t, metadata=first.metadata) for t in g["hits"])
+            continue
+
+        wanted: set = set()
+        for hit in g["hits"]:
+            if hit in page_chunks:
+                i = page_chunks.index(hit)
+                wanted.update(range(max(0, i - window), min(len(page_chunks), i + window + 1)))
+        if not wanted:
+            result.extend(Document(page_content=t, metadata=first.metadata) for t in g["hits"])
+            continue
+
+        text = ""
+        prev = None
+        for i in sorted(wanted):
+            if prev is None:
+                text = page_chunks[i]
+            elif i == prev + 1:
+                text = _join_chunks(text, page_chunks[i])
+            else:
+                text = text + "\n...\n" + page_chunks[i]
+            prev = i
+        result.append(Document(page_content=text, metadata=first.metadata))
+    return result
+
+
+# ── 識別碼精確比對（錯誤碼／CLI 指令名）──────────────────────────────────────
+# 向量檢索分不出 CMMVC5770E 與 CMMVC5767E（語意幾乎相同），所以問題含這類識別碼時，
+# 直接用「網址最後一段 topic 名稱」找出對應頁面（例如 ...?topic=messages-cmmvc5770e），
+# 補入候選。每個版本／產品各有一頁，取最新版本優先的前幾頁。
+_ERROR_CODE_RE = re.compile(r"\b(CMM[A-Z]{2}\d{4}[A-Z]?)\b", re.IGNORECASE)
+_EXACT_PAGES_PER_ID = int(os.environ.get("RAG_EXACT_PAGES_PER_ID", "4"))
+_EXACT_MAX_IDS = 3
+# 這些 CLI 指令名同時是一般英文單字（如 "host connection"），單獨出現時不視為指令，避免誤判
+_AMBIGUOUS_CMD_WORDS = frozenset({
+    "backup", "clear", "help", "host", "metadata", "ping", "restore", "snap", "traceroute",
+    "test", "exit", "include", "lock", "unlock", "start", "stop", "view", "quit", "system",
+    "volume", "node", "port", "user", "license",
+})
+
+_topic_index_lock = threading.Lock()
+_topic_index_cache: Dict[str, Dict[str, List[str]]] = {}
+
+
+def _persist_dir(vectorstore: Chroma) -> Optional[str]:
+    try:
+        return vectorstore._client.get_settings().persist_directory
+    except Exception:
+        return None
+
+
+def _load_topic_index(vectorstore: Chroma) -> Dict[str, List[str]]:
+    """
+    建立 {topic 名稱(小寫) → [網址, ...]} 索引，只在第一次查詢時載入並快取。
+    以唯讀方式直接讀 Chroma 的 SQLite（約 5 萬個網址，耗時不到 0.1 秒）。
+    """
+    pdir = _persist_dir(vectorstore)
+    if not pdir:
+        return {}
+    with _topic_index_lock:
+        if pdir in _topic_index_cache:
+            return _topic_index_cache[pdir]
+        index: Dict[str, List[str]] = {}
+        try:
+            db = sqlite3.connect(f"file:{pdir}/chroma.sqlite3?mode=ro", uri=True, timeout=5)
+            try:
+                rows = db.execute(
+                    "SELECT DISTINCT string_value FROM embedding_metadata "
+                    "WHERE key='source' AND string_value LIKE 'http%'"
+                )
+                for (url,) in rows:
+                    if "topic=" in url:
+                        index.setdefault(url.rsplit("topic=", 1)[-1].lower(), []).append(url)
+            finally:
+                db.close()
+        except Exception:
+            index = {}
+        _topic_index_cache[pdir] = index
+        return index
+
+
+def _extract_identifiers(question: str, index: Dict[str, List[str]]) -> List[str]:
+    """
+    從問題抽出要精確比對的 topic 名稱。
+      - 錯誤碼：CMMVC5770E → messages-cmmvc5770e
+      - CLI 指令：問題中的英數單字若剛好是 commands-<單字> 頁面（如 lssystem、mkvolume），
+        但排除同時是一般英文單字的指令名（host、backup 等）
+    只接受索引裡真的存在的 topic，所以不會因誤判而回傳不存在的頁面。
+    """
+    found: List[str] = []
+    for code in _ERROR_CODE_RE.findall(question):
+        key = f"messages-{code.lower()}"
+        if key in index and key not in found:
+            found.append(key)
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", question):
+        w = word.lower()
+        if w in _AMBIGUOUS_CMD_WORDS:
+            continue
+        key = f"commands-{w}"
+        if key in index and key not in found:
+            found.append(key)
+    return found[:_EXACT_MAX_IDS]
+
+
+def _url_version_key(url: str) -> Tuple[int, ...]:
+    """網址形如 .../flashsystem-5x00/9.1.3?topic=... → (9, 1, 3)，用於新版本優先排序。"""
+    m = re.search(r"/(\d+(?:\.\d+)*)\?topic=", url)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
+def _exact_identifier_docs(
+    question: str,
+    vectorstore: Chroma,
+    where_filter: Optional[Dict[str, Any]] = None,
+    pages_per_id: int = _EXACT_PAGES_PER_ID,
+) -> List[Document]:
+    """
+    取回問題中錯誤碼／指令名對應的網頁 chunk（依寫入順序）。
+
+    - 同一識別碼在不同產品／版本各有一頁；使用者有指定 version 時只取該版本，
+      否則取最新版本優先的前 pages_per_id 頁，避免塞入太多幾乎相同的內容。
+    - 查詢失敗或索引不可用時回傳空列表，不影響原本的向量搜尋流程。
+    """
+    index = _load_topic_index(vectorstore)
+    if not index:
+        return []
+    wanted_version = None
+    if where_filter:
+        v = where_filter.get("version")
+        if isinstance(v, dict):
+            wanted_version = v.get("$eq")
+
+    docs: List[Document] = []
+    for key in _extract_identifiers(question, index):
+        urls = index[key]
+        if wanted_version:
+            urls = [u for u in urls if f"/{wanted_version}?" in u]
+        urls = sorted(urls, key=_url_version_key, reverse=True)[:pages_per_id]
+        if not urls:
+            continue
+        try:
+            r = vectorstore._collection.get(
+                where={"source": {"$in": urls}}, include=["documents", "metadatas"]
+            )
+        except Exception:
+            continue
+        for d, m in zip(r["documents"], r["metadatas"]):
+            docs.append(Document(page_content=d, metadata=m))
+    return docs
+
 
 
 # 從問題中抽取型號編號（4 位數），對應到可能的文件 source 檔名前綴
@@ -222,11 +446,22 @@ class LocalRAGFilter:
             where_filter=where if where else None,
         )
 
-        # ── 3. 去重 ──
-        deduped = _deduplicate(raw_docs)
+        # ── 2b. 錯誤碼／指令名精確比對（向量檢索分不出相近的識別碼）──
+        exact_docs = _exact_identifier_docs(question, self.vectorstore, where if where else None)
+        exact_keys = {d.page_content[:100].strip() for d in exact_docs}
 
-        # ── 4. 依 source_type 優先分數排序 ──
-        ranked = sorted(deduped, key=_score_chunk, reverse=True)
+        # ── 3. 去重（精確命中放最前面，同內容時保留精確命中那份）──
+        deduped = _deduplicate(exact_docs + raw_docs)
+
+        # ── 4. 依 source_type 優先分數排序；精確命中的頁面固定排在最前 ──
+        ranked = sorted(
+            deduped,
+            key=lambda d: (d.page_content[:100].strip() in exact_keys, _score_chunk(d)),
+            reverse=True,
+        )
+
+        # ── 4b. 命中的 web / pdf chunk 展開成同頁前後文（同頁合併）──
+        ranked = _expand_with_neighbors(ranked, self.vectorstore)
 
         # ── 5. 截斷到 context 上限 ──
         selected: List[Document] = []
@@ -234,7 +469,7 @@ class LocalRAGFilter:
         for doc in ranked:
             length = len(doc.page_content)
             if total_chars + length > _MAX_CONTEXT_CHARS:
-                break
+                continue   # 展開後單筆可能較長：跳過它，讓後面較短的仍有機會入選
             selected.append(doc)
             total_chars += length
 
@@ -667,7 +902,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
     from src.build_vectorstore import load_vectorstore
 
-    persist_dir     = sys.argv[1] if len(sys.argv) > 1 else "/Volumes/SSD_4TB/RAG/vectorstore"
+    persist_dir     = sys.argv[1] if len(sys.argv) > 1 else "/Users/yhkuo/RAG/vectorstore"
     collection_name = sys.argv[2] if len(sys.argv) > 2 else "flashsystem_all"
 
     vs     = load_vectorstore(persist_dir, collection_name)

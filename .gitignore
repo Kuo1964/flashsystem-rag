@@ -27,3 +27,4 @@ logs/
 # IDE
 .idea/
 .vscode/
+.env.bak*

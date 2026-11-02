@@ -16,20 +16,29 @@ Collection 命名策略：
 """
 
 import hashlib
+import os
 from pathlib import Path
 from typing import List, Optional
 
 import chromadb
+from dotenv import load_dotenv
 from langchain.schema import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from tqdm import tqdm
 
+load_dotenv()
+
 # 每批次寫入的 Document 數量（避免記憶體溢出）
 _BATCH_SIZE = 500
 
-# 預設 Embedding 模型（多語言，適合技術文件）
-DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+# 預設 Embedding 模型（多語言、長上下文）。可用環境變數 RAG_EMBED_MODEL 覆寫。
+# 注意：不同模型的向量維度不同，collection 必須與建立時的模型一致，
+# 因此換模型時要同時換 RAG_COLLECTION（scripts/migrate_embeddings.py 會建立新 collection）。
+DEFAULT_EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "BAAI/bge-m3")
+
+_EMBED_DEVICE = os.environ.get("RAG_EMBED_DEVICE", "cpu")
+_EMBED_BATCH = int(os.environ.get("RAG_EMBED_BATCH", "32"))
 
 
 _embeddings_cache: dict = {}
@@ -38,13 +47,13 @@ _embeddings_cache: dict = {}
 def get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:  # type: ignore[return]
     """
     取得 HuggingFace Embedding 模型實例（同一模型只載入一次，後續重用）。
-    首次執行時會自動下載模型（約 1GB）。
+    首次執行時會自動下載模型。
     """
     if model_name not in _embeddings_cache:
         _embeddings_cache[model_name] = HuggingFaceEmbeddings(
             model_name=model_name,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
+            model_kwargs={"device": _EMBED_DEVICE},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": _EMBED_BATCH},
         )
     return _embeddings_cache[model_name]
 

@@ -164,7 +164,7 @@ def load_json_docs(json_dir: str) -> List[Document]:
 if __name__ == "__main__":
     import sys
 
-    json_dir = sys.argv[1] if len(sys.argv) > 1 else "/Volumes/SSD_4TB/RAG/raw_data/manual_docs"
+    json_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/yhkuo/RAG/raw_data/manual_docs"
     docs = load_json_docs(json_dir)
     if docs:
         print(f"\n範例段落：\n{docs[0].page_content}\nMetadata：{docs[0].metadata}")

@@ -42,10 +42,10 @@ load_dotenv()
 
 # ── 預設路徑設定（可透過 .env 或命令列參數覆寫）──────────────────────────
 
-DEFAULT_PDF_DIR    = os.environ.get("RAG_PDF_DIR",    "/Volumes/SSD_4TB/RAG/raw_data/pdfs")
-DEFAULT_URL_FILE   = os.environ.get("RAG_URL_FILE",   "/Volumes/SSD_4TB/RAG/raw_data/web_urls.txt")
-DEFAULT_JSON_DIR   = os.environ.get("RAG_JSON_DIR",   "/Volumes/SSD_4TB/RAG/raw_data/manual_docs")
-DEFAULT_VECTOR_DIR = os.environ.get("RAG_VECTOR_DIR", "/Volumes/SSD_4TB/RAG/vectorstore")
+DEFAULT_PDF_DIR    = os.environ.get("RAG_PDF_DIR",    "/Users/yhkuo/RAG/raw_data/pdfs")
+DEFAULT_URL_FILE   = os.environ.get("RAG_URL_FILE",   "/Users/yhkuo/RAG/raw_data/web_urls.txt")
+DEFAULT_JSON_DIR   = os.environ.get("RAG_JSON_DIR",   "/Users/yhkuo/RAG/raw_data/manual_docs")
+DEFAULT_VECTOR_DIR = os.environ.get("RAG_VECTOR_DIR", "/Users/yhkuo/RAG/vectorstore")
 DEFAULT_COLLECTION = os.environ.get("RAG_COLLECTION",  "flashsystem_all")
 
 
@@ -106,6 +106,7 @@ def cmd_build(args: argparse.Namespace) -> None:
             on_flush=_write,
             flush_every=100,
             state_file=state_file,
+            workers=args.workers,
         )
         all_docs.extend(web_docs)
 
@@ -225,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--chunk-size",    default=1000, type=int,   help="段落最大字元數")
     p_build.add_argument("--chunk-overlap", default=150,  type=int,   help="段落重疊字元數")
     p_build.add_argument("--max-web-pages", default=200,  type=int,   help="每個根網址最多爬取子頁面數")
+    p_build.add_argument("--workers",       default=1,    type=int,   help="同時使用的瀏覽器數量（預設 1，建議 2~3）")
     p_build.add_argument("--reset",         action="store_true",      help="清除舊資料後重建")
     p_build.set_defaults(func=cmd_build)
 

@@ -26,10 +26,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── 預設路徑（從 .env 讀取）─────────────────────────────────────────────────
-_PDF_DIR    = os.environ.get("RAG_PDF_DIR",    "/Volumes/SSD_4TB/RAG/raw_data/pdfs")
-_URL_FILE   = os.environ.get("RAG_URL_FILE",   "/Volumes/SSD_4TB/RAG/raw_data/web_urls.txt")
-_JSON_DIR   = os.environ.get("RAG_JSON_DIR",   "/Volumes/SSD_4TB/RAG/raw_data/manual_docs")
-_VECTOR_DIR = os.environ.get("RAG_VECTOR_DIR", "/Volumes/SSD_4TB/RAG/vectorstore")
+_PDF_DIR    = os.environ.get("RAG_PDF_DIR",    "/Users/yhkuo/RAG/raw_data/pdfs")
+_URL_FILE   = os.environ.get("RAG_URL_FILE",   "/Users/yhkuo/RAG/raw_data/web_urls.txt")
+_JSON_DIR   = os.environ.get("RAG_JSON_DIR",   "/Users/yhkuo/RAG/raw_data/manual_docs")
+_VECTOR_DIR = os.environ.get("RAG_VECTOR_DIR", "/Users/yhkuo/RAG/vectorstore")
 _COLLECTION = os.environ.get("RAG_COLLECTION",  "flashsystem_all")
 
 # ── 全域狀態（跨回呼共用）───────────────────────────────────────────────────
@@ -172,6 +172,7 @@ def ingest_web_urls(
     max_pages: int,
     vector_dir: str,
     collection: str,
+    workers: int = 1,
 ) -> str:
     """爬取網頁並加入向量資料庫。"""
     if not _build_lock.acquire(blocking=False):
@@ -207,6 +208,7 @@ def ingest_web_urls(
             max_pages_per_root=int(max_pages),
             on_flush=_write_batch,
             flush_every=100,
+            workers=int(workers),
             # 記錄已寫入的頁面；重啟後重新爬取會自動跳過這些頁面
             state_file=default_state_file(vector_dir, collection),
         )
@@ -436,13 +438,17 @@ def build_ui() -> gr.Blocks:
                             minimum=1, maximum=7000, step=50, value=200,
                             label="每個根網址最多爬取頁數",
                         )
+                        workers_slider = gr.Slider(
+                            minimum=1, maximum=4, step=1, value=1,
+                            label="同時使用的瀏覽器數量（建議 2~3）",
+                        )
                 web_btn    = gr.Button("🕷️ 爬取並加入 RAG", variant="primary")
                 web_status = gr.Textbox(label="爬取狀態", interactive=False)
 
                 web_btn.click(
                     fn=ingest_web_urls,
                     inputs=[url_textarea, url_file_upload, max_pages_slider,
-                            t2_vector_dir, t2_collection],
+                            t2_vector_dir, t2_collection, workers_slider],
                     outputs=web_status,
                 )
 

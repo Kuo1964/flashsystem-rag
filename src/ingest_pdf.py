@@ -94,6 +94,6 @@ def load_pdfs(pdf_dir: str, chunk_size: int = 1000, chunk_overlap: int = 150) ->
 if __name__ == "__main__":
     import sys
 
-    pdf_dir = sys.argv[1] if len(sys.argv) > 1 else "/Volumes/SSD_4TB/RAG/raw_data/pdfs"
+    pdf_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/yhkuo/RAG/raw_data/pdfs"
     docs = load_pdfs(pdf_dir)
     print(f"範例段落：\n{docs[0].page_content[:300]}\nMetadata：{docs[0].metadata}")
