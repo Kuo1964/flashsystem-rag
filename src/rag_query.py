@@ -22,14 +22,14 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ibm import WatsonxLLM
+from langchain_ibm import ChatWatsonx
 
 load_dotenv()
 
@@ -383,9 +383,98 @@ def _boost_model_docs(
     return boosted
 
 
+def _decompose_expert_queries(question: str) -> List[str]:
+    """
+    根據問題中的領域關鍵字與意圖，將單一問題拆解/擴展為多個互補維度的檢索查詢矩陣。
+    涵蓋：核心架構概念、容錯/高可用/維護、具體操作指令與配置、最佳實踐/遷移策略。
+    """
+    queries = [question]
+    q_lower = question.lower()
+
+    # 1. PBHA / 雙活 / 複製高可用
+    if any(k in q_lower for k in ["pbha", "policy-based", "雙活", "双活", "high availability", "active-active", "replication policy", "ha policy"]):
+        queries.append("Policy-Based High Availability replication volume group maintenance failover")
+        queries.append("chvolumegroupreplication replicationpolicy high availability consistent_synchronized")
+
+    # 2. DRAID / 硬碟更換 / 擴容限制 / 空間新增
+    if any(k in q_lower for k in ["draid", "raid", "硬盤", "硬盘", "drive", "expand", "capacity", "擴充", "扩容", "更換", "更换", "新增", "空間", "空间"]):
+        queries.append("DRAID distributed raid replace drives with larger capacity array expansion limitations")
+        queries.append("charray expandarray drive upgrade distributed raid member drive class")
+        queries.append("rmarray rmmdisk force migrate used extents online storage pool")
+        queries.append("migratevdisk data migration between storage pools online addvdiskcopy")
+
+    # 3. MDisk / Storage Pool / Extent 在線搬移 / 陣列移除
+    if any(k in q_lower for k in ["mdisk", "pool", "extent", "遷移", "迁移", "migrate", "rmmdisk", "rmarray"]):
+        queries.append("rmarray rmmdisk force migrate used extents online storage pool")
+        queries.append("migratevdisk data migration between storage pools online addvdiskcopy")
+
+    # 4. Safeguarded Copy / 快照 / 安全副本
+    if any(k in q_lower for k in ["safeguarded", "snapshot", "快照", "備份", "备份", "ransomware"]):
+        queries.append("Safeguarded Copy volume group snapshot policy backup recovery")
+
+    # 5. SVC / 虛擬化控制器擴容
+    if any(k in q_lower for k in ["svc", "san volume controller", "virtualize"]):
+        queries.append("SVC detectmdisk addmdisk storage pool expansion backend storage")
+
+    # 6. 錯誤碼或特定故障排除
+    for err in _ERROR_CODE_RE.findall(question):
+        queries.append(f"{err} error code description cause action resolution")
+
+    # 7. CLI 指令名（英數單詞若可能為指令）
+    for word in re.findall(r"\b[A-Za-z][A-Za-z0-9_]{3,}\b", question):
+        w = word.lower()
+        if w in _AMBIGUOUS_CMD_WORDS:
+            continue
+        if any(w.startswith(prefix) for prefix in ("ls", "ch", "mk", "rm", "expand", "migrate", "detect", "add")):
+            queries.append(f"{w} CLI command syntax parameters examples")
+
+    return list(dict.fromkeys(queries))
+
+
+def _reciprocal_rank_fusion(doc_lists: List[List[Document]], k: int = 60) -> List[Document]:
+    """
+    Reciprocal Rank Fusion (RRF) 演算法：
+    將多路檢索得到的候選文件清單依據 RRF 分數進行融合加權與去重。
+    RRF(d) = sum(1.0 / (k + rank_i(d)))
+    """
+    scores: Dict[str, float] = {}
+    doc_map: Dict[str, Document] = {}
+
+    for doc_list in doc_lists:
+        for rank, doc in enumerate(doc_list):
+            key = doc.page_content[:120].strip()
+            if key not in doc_map:
+                doc_map[key] = doc
+            scores[key] = scores.get(key, 0.0) + (1.0 / (k + rank + 1))
+
+    # 依 RRF 分數降序排列
+    sorted_keys = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return [doc_map[x] for x in sorted_keys]
+
+
+def _filter_noisy_chunks(docs: List[Document], question: str) -> List[Document]:
+    """
+    過濾與特定儲存架構或指令操作主題無關的通用物理/環境警語雜訊。
+    """
+    noise_patterns = [
+        re.compile(r"open expansion enclosure lid reduces airflow", re.IGNORECASE),
+        re.compile(r"do not leave the lid open for more than 15 minutes", re.IGNORECASE),
+        re.compile(r"terms and conditions for information centers", re.IGNORECASE),
+        re.compile(r"notices and trademarks", re.IGNORECASE),
+    ]
+
+    filtered: List[Document] = []
+    for doc in docs:
+        content = doc.page_content
+        if any(pat.search(content) for pat in noise_patterns):
+            continue
+        filtered.append(doc)
+    return filtered
+
+
 class LocalRAGFilter:
     """
-    第一層：本機向量搜尋 + 品質過濾。
+    第一層：多維度本機向量搜尋 + RRF 融合 + 品質過濾。
     完全在本機執行，不呼叫任何外部 API。
     """
 
@@ -394,9 +483,6 @@ class LocalRAGFilter:
         Args:
             vectorstore: 已載入的 Chroma 向量資料庫。
             top_k:       初始搜尋取得的候選段落數（過濾前）。
-                         過濾後實際使用的段落數會少於此值。
-                         預設從 8 提高至 30：fs7600 的 PSU 相關 chunk
-                         在向量相似度排名約第 98 位，需要更大的搜尋範圍。
         """
         self.vectorstore = vectorstore
         self.top_k = top_k
@@ -408,7 +494,7 @@ class LocalRAGFilter:
         source_type: Optional[str] = None,
     ) -> FilterResult:
         """
-        執行本機 RAG 過濾。
+        執行本機多維度 RAG 檢索與融合過濾。
 
         Args:
             question:    使用者問題。
@@ -418,7 +504,6 @@ class LocalRAGFilter:
         Returns:
             FilterResult：包含篩選後段落、context 文字、引用來源。
         """
-        # ── 1. 向量搜尋（MMR 保證多樣性）──
         where: Dict[str, Any] = {}
         if version:
             where["version"] = {"$eq": version}
@@ -427,17 +512,35 @@ class LocalRAGFilter:
 
         search_kwargs: Dict[str, Any] = {
             "k": self.top_k,
-            "fetch_k": self.top_k * 8,   # 原本 4x 不足，提高至 8x 增加多樣性
+            "fetch_k": self.top_k * 8,
         }
         if where:
             search_kwargs["filter"] = where
 
-        raw_docs = self.vectorstore.as_retriever(
+        # ── 1. 多維度查詢矩陣分解 ──
+        sub_queries = _decompose_expert_queries(question)
+
+        # ── 2. 多路並行檢索 ──
+        multi_results: List[List[Document]] = []
+        retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs=search_kwargs,
-        ).invoke(question)
+        )
+        for sq in sub_queries:
+            try:
+                docs = retriever.invoke(sq)
+                multi_results.append(docs)
+            except Exception:
+                pass
 
-        # ── 2. 型號強制補入（問題含型號關鍵字時，確保該型號文件一定進入候選）──
+        if not multi_results:
+            raw_docs = []
+        elif len(multi_results) == 1:
+            raw_docs = multi_results[0]
+        else:
+            raw_docs = _reciprocal_rank_fusion(multi_results, k=60)
+
+        # ── 3. 型號強制補入 ──
         raw_docs = _boost_model_docs(
             question=question,
             vectorstore=self.vectorstore,
@@ -446,21 +549,22 @@ class LocalRAGFilter:
             where_filter=where if where else None,
         )
 
-        # ── 2b. 錯誤碼／指令名精確比對（向量檢索分不出相近的識別碼）──
+        # ── 4. 錯誤碼／指令名精確比對 ──
         exact_docs = _exact_identifier_docs(question, self.vectorstore, where if where else None)
         exact_keys = {d.page_content[:100].strip() for d in exact_docs}
 
-        # ── 3. 去重（精確命中放最前面，同內容時保留精確命中那份）──
+        # ── 5. 去重與雜訊過濾 ──
         deduped = _deduplicate(exact_docs + raw_docs)
+        clean_docs = _filter_noisy_chunks(deduped, question)
 
-        # ── 4. 依 source_type 優先分數排序；精確命中的頁面固定排在最前 ──
+        # ── 6. 依 source_type 優先分數排序；精確命中的頁面固定排在最前 ──
         ranked = sorted(
-            deduped,
+            clean_docs,
             key=lambda d: (d.page_content[:100].strip() in exact_keys, _score_chunk(d)),
             reverse=True,
         )
 
-        # ── 4b. 命中的 web / pdf chunk 展開成同頁前後文（同頁合併）──
+        # ── 7. 命中的 web / pdf chunk 展開成同頁前後文（同頁合併）──
         ranked = _expand_with_neighbors(ranked, self.vectorstore)
 
         # ── 5. 截斷到 context 上限 ──
@@ -581,11 +685,19 @@ def _detect_model_mismatch(question: str, docs: List[Document]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXPERT_PROMPT_TEMPLATE = """\
-你是一位精通 IBM FlashSystem 儲存系統的專家工程師。
+你是一位具備原廠實戰經驗的 IBM Storage FlashSystem / IBM Storage Virtualize 資深儲存架構師。
+請只依據下方【參考資料】回答使用者問題，並以【繁體中文】輸出可直接執行的專家級方案。
 
-以下是從 IBM FlashSystem 官方文件（PDF 手冊、IBM Docs 網頁、技術白名單）中檢索到的參考段落，以及使用者的問題。
-
-請根據參考資料，以**繁體中文**撰寫詳盡的結構化專家回答。
+== 回答原則 ==
+1. 先檢驗問題的前提：使用者提出的做法或假設，在參考資料所述的產品架構與限制下是否成立？
+   若不成立，要明確寫出「不可行」，說明原因與資料依據，再提出可行的替代方案。
+   若有多個可行方案，逐一說明可行或被排除的理由，並指出推薦方案。
+2. 涉及容量、時間、數量的規劃，只使用問題中給定的數字做推算，並列出推算假設；問題沒給的數字不要自行編造。
+3. 所有 CLI 指令的名稱、參數與語法，必須逐字出自【參考資料】。參考資料沒有出現的指令或參數一律不得輸出；
+   資料不足時寫「參考資料未涵蓋，需查閱 CLI Guide」，不得憑記憶補寫。不同版本語法可能不同，以參考資料標示的版本為準。
+4. 每個階段都要有「驗收標準」：執行後用哪個指令檢查、看到什麼結果才算通過，通過後才能進入下一階段。
+5. 只能引用【參考資料】中出現的文件與頁碼（沿用其 [n] 編號、檔名、頁碼或網址）；不得編造文件名稱、章節或頁碼。
+6. 參考資料的型號或版本與問題不一致時，要明確說明。
 
 == 參考資料 ==
 {context}
@@ -593,27 +705,27 @@ _EXPERT_PROMPT_TEMPLATE = """\
 == 使用者問題 ==
 {question}
 
-== 回答格式要求 ==
-請嚴格依照以下格式輸出，不可新增或刪除任何段落標籤。所有內容必須使用繁體中文。
+== 輸出格式（必須使用以下五個標籤，標籤名稱不可更動；下列為格式說明，不是內容範例） ==
 
 [DIAGNOSIS]
-<說明使用者的問題核心，以及涉及哪些 FlashSystem 概念或元件。>
+用「-」條列：前提檢驗結論（成立或不成立與原因）、方案比較（各方案可行或排除的理由與推薦方案）、
+規劃推算（若問題提供了數字）。
 
 [STEPS]
-<具體的操作步驟、指令或解答，以編號列表呈現。若無步驟請填「不適用」。>
-1.
-2.
-3.
+依執行順序分成多個階段。最上層以「1.」「2.」「3.」編號，每個編號代表一個階段（階段標題寫明目的）；
+階段內的細項一律用「-」，不要再用數字編號。每個階段都要包含：
+- 動作說明
+- 指令區塊（```bash 程式碼區塊，每個指令前以 # 註解說明用途；指令必須出自參考資料）
+- 驗收標準（檢查指令與預期結果）
 
 [RISKS]
-<使用者必須注意的風險、警告或前提條件，以項目符號列表呈現。若無風險請填「無」。>
--
+用「-」條列，每條格式為「異常情境：現象或原因 → 處置與回滾方式」。
 
 [SUMMARY]
-<用一段話簡潔地總結完整回答。>
+用 2～3 句話總結結論與最關鍵的前提條件。
 
 [SOURCES]
-<列出本回答引用的參考資料編號，例如 [1]、[3]。>
+每條一行，格式為「[n] 檔名或網址 p.頁碼 — 此來源支持的論點」；沒有頁碼的來源省略頁碼。
 """
 
 _EXPERT_PROMPT = PromptTemplate(
@@ -637,16 +749,37 @@ def _extract_sections(raw: str) -> dict:
     return sections
 
 
+def _validate_and_sanitize_cli(text: str) -> str:
+    """
+    CLI 防幻覺校驗器：
+    自動校正 LLM 輸出中常見的 Storage Virtualize 指令幻覺與參數錯誤。
+    """
+    if not text:
+        return text
+
+    # 1. mkpool 指令校正 -> mkmdiskgrp
+    text = re.sub(r"\bmkpool\s+-name\s+([A-Za-z0-9_-]+)", r"mkmdiskgrp -ext 1024 -name \1", text)
+    text = re.sub(r"\bmkpool\b", "mkmdiskgrp", text)
+
+    # 2. lsvolumegroup -replicationpolicy -> lsvolumegroup
+    text = re.sub(r"\blsvolumegroup\s+-replicationpolicy\b", "lsvolumegroup", text)
+
+    # 3. mkarray 參數修正：移除錯誤的 -pool 參數
+    text = re.sub(r"\bmkarray\b(.*?)(\s+-name\s+[A-Za-z0-9_-]+)?\s+-pool\s+([A-Za-z0-9_-]+)", r"mkarray\1 \3", text)
+
+    return text
+
+
 def _parse_expert_output(raw: str, question: str, filter_result: FilterResult) -> ExpertAnswer:
-    """將 LLM 的結構化文字輸出解析成 ExpertAnswer。"""
-    sections = _extract_sections(raw)
+    """將 LLM 的結構化文字輸出解析成 ExpertAnswer 並進行 CLI 防幻覺校驗。"""
+    raw_sanitized = _validate_and_sanitize_cli(raw)
+    sections = _extract_sections(raw_sanitized)
 
     # 至少要有 DIAGNOSIS 或 SUMMARY 才算成功解析
     if not sections or ("DIAGNOSIS" not in sections and "SUMMARY" not in sections):
-        # 嘗試把截斷的原始輸出直接當 diagnosis 顯示，而非空白
         return ExpertAnswer(
             question=question,
-            diagnosis=raw.strip() if raw.strip() else "（LLM 未回傳任何內容）",
+            diagnosis=raw_sanitized.strip() if raw_sanitized.strip() else "（LLM 未回傳任何內容）",
             steps=[],
             risks=[],
             summary="（輸出格式解析失敗，請參閱上方診斷欄位的原始 LLM 輸出）",
@@ -655,18 +788,36 @@ def _parse_expert_output(raw: str, question: str, filter_result: FilterResult) -
             filter_result=filter_result,
         )
 
-    diagnosis   = sections.get("DIAGNOSIS", "")
-    steps_raw   = sections.get("STEPS", "")
+    diagnosis   = _validate_and_sanitize_cli(sections.get("DIAGNOSIS", ""))
+    steps_raw   = _validate_and_sanitize_cli(sections.get("STEPS", ""))
     risks_raw   = sections.get("RISKS", "")
-    summary     = sections.get("SUMMARY", "")
+    summary     = _validate_and_sanitize_cli(sections.get("SUMMARY", ""))
+    sources_raw = sections.get("SOURCES", "")
 
-    # 解析 steps：取出編號列表（相容中英文數字、全形句號）
-    steps = [
-        re.sub(r"^[\d１-９]+[.．、\s]+", "", line).strip()
-        for line in steps_raw.splitlines()
-        if re.match(r"^[\d１-９]+[.．、]", line.strip())
-    ]
-    # 若編號解析失敗但有內容，直接按行保留
+    # 解析 steps：智慧處理可能跨多行的 Mermaid 或程式碼區塊
+    steps: List[str] = []
+    current_step: List[str] = []
+    in_code_block = False
+
+    for line in steps_raw.splitlines():
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            current_step.append(line)
+            continue
+
+        if not in_code_block and re.match(r"^[\d１-９]+[.．、]", line.strip()):
+            if current_step:
+                steps.append("\n".join(current_step).strip())
+                current_step = []
+            clean_line = re.sub(r"^[\d１-９]+[.．、\s]+", "", line).strip()
+            current_step.append(clean_line)
+        else:
+            if line.strip():
+                current_step.append(line)
+
+    if current_step:
+        steps.append("\n".join(current_step).strip())
+
     if not steps and steps_raw:
         steps = [line.strip() for line in steps_raw.splitlines() if line.strip()]
 
@@ -676,12 +827,18 @@ def _parse_expert_output(raw: str, question: str, filter_result: FilterResult) -
         for line in risks_raw.splitlines()
         if line.strip() and line.strip()[0] in "-•*－"
     ]
-    # 若 bullet 解析失敗但有內容，直接按行保留
     if not risks and risks_raw and risks_raw not in ("無", "None", "N/A"):
         risks = [line.strip() for line in risks_raw.splitlines() if line.strip()]
 
-    # sources：使用第一層檢索到的 source_refs
-    sources = filter_result.source_refs
+    # sources：優先解析 LLM 生成的具體手冊與章節引用；若為空則 fallback
+    sources: List[str] = []
+    for line in sources_raw.splitlines():
+        s = line.strip()
+        if s and (s.startswith("[") or s.startswith("-") or s.startswith("•")):
+            sources.append(s)
+
+    if not sources:
+        sources = filter_result.source_refs
 
     return ExpertAnswer(
         question=question,
@@ -700,7 +857,7 @@ def _build_watsonx_llm(
     project_id: Optional[str] = None,
     api_key: Optional[str] = None,
     url: Optional[str] = None,
-) -> WatsonxLLM:
+) -> ChatWatsonx:
     resolved_model   = model_id   or os.environ.get("WATSONX_MODEL_ID",   "ibm/granite-13b-chat-v2")
     resolved_project = project_id or os.environ.get("WATSONX_PROJECT_ID", "")
     resolved_api_key = api_key    or os.environ.get("WATSONX_APIKEY",     "")
@@ -711,19 +868,16 @@ def _build_watsonx_llm(
     if not resolved_project:
         raise ValueError("缺少 WATSONX_PROJECT_ID。請在 .env 檔案中設定。")
 
-    return WatsonxLLM(
+    max_tokens = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "8192"))
+
+    return ChatWatsonx(
         model_id=resolved_model,
         url=resolved_url,
         project_id=resolved_project,
         apikey=resolved_api_key,
         params={
-            "decoding_method": "greedy",
-            "max_new_tokens": 2048,
-            "min_new_tokens": 1,
+            "max_tokens": max_tokens,
             "temperature": 0.05,
-            "top_k": 50,
-            "top_p": 1,
-            "repetition_penalty": 1.05,
         },
     )
 
@@ -734,6 +888,7 @@ def _build_gemini_llm(
 ) -> ChatGoogleGenerativeAI:
     resolved_model   = model_id or os.environ.get("GEMINI_MODEL_ID", "gemini-2.0-flash")
     resolved_api_key = api_key  or os.environ.get("GEMINI_API_KEY",  "")
+    max_tokens = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "8192"))
 
     if not resolved_api_key:
         raise ValueError("缺少 GEMINI_API_KEY。請在 .env 檔案中設定。")
@@ -742,7 +897,7 @@ def _build_gemini_llm(
         model=resolved_model,
         google_api_key=resolved_api_key,
         temperature=0.05,
-        max_output_tokens=8192,   # 原本 2048 不足以容納繁體中文完整回答，提高至 8192
+        max_output_tokens=max_tokens,
     )
 
 

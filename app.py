@@ -16,6 +16,7 @@ IBM FlashSystem RAG 系統 — Gradio Web UI
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -123,20 +124,45 @@ def chat_fn(
         parts.append(f"**📋 診斷**\n{answer.diagnosis}")
 
     if answer.steps:
-        steps_md = "\n".join(f"{i}. {s}" for i, s in enumerate(answer.steps, 1))
-        parts.append(f"**🔧 操作步驟**\n{steps_md}")
+        step_items = []
+        text_step_counter = 1
+        for s in answer.steps:
+            s_clean = s.strip()
+            if s_clean.startswith("```"):
+                step_items.append(s_clean)
+            else:
+                # 移除既有的可能錯誤跳號開頭，重新按序賦予標準編號
+                clean_body = re.sub(r"^[\d１-９]+[.．、\s]+", "", s_clean).strip()
+                step_items.append(f"{text_step_counter}. {clean_body}")
+                text_step_counter += 1
+        steps_md = "\n\n".join(step_items)
+        parts.append(f"**🔧 操作步驟與架構流程**\n\n{steps_md}")
 
     if answer.risks and answer.risks != ["None"]:
-        risks_md = "\n".join(f"- ⚠ {r}" for r in answer.risks if r)
-        if risks_md:
-            parts.append(f"**⚠ 風險與注意事項**\n{risks_md}")
+        risk_items = []
+        for r in answer.risks:
+            r_clean = r.strip()
+            if not r_clean:
+                continue
+            if r_clean.startswith("-") or r_clean.startswith("•") or r_clean.startswith("⚠"):
+                risk_items.append(r_clean)
+            else:
+                risk_items.append(f"- ⚠ {r_clean}")
+        if risk_items:
+            parts.append(f"**⚠ 關鍵防護指標與風險防範**\n" + "\n".join(risk_items))
 
     if answer.summary:
-        parts.append(f"**✅ 總結**\n{answer.summary}")
+        parts.append(f"**✅ 專家總結**\n{answer.summary}")
 
     if answer.sources:
-        srcs_md = "\n".join(f"- {s}" for s in answer.sources)
-        parts.append(f"**📚 引用來源**\n{srcs_md}")
+        src_items = []
+        for s in answer.sources:
+            s_clean = s.strip()
+            if s_clean.startswith("[") or s_clean.startswith("-") or s_clean.startswith("•"):
+                src_items.append(s_clean)
+            else:
+                src_items.append(f"- {s_clean}")
+        parts.append(f"**📚 官方文件出處與引文**\n" + "\n".join(src_items))
 
     response = "\n\n---\n\n".join(parts) if parts else "（無回答）"
     history.append({"role": "user", "content": message})
