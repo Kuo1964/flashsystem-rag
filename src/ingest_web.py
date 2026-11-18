@@ -26,6 +26,9 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
 
 from src.crawl_state import open_state
@@ -39,18 +42,19 @@ _CONTENT_SELECTORS = [
     "main",
     "article",
 ]
+_CONTENT_CSS_JOINED = ", ".join(_CONTENT_SELECTORS)
 
 # 從 IBM Docs URL 解析版本與產品
 _DOCS_RE = re.compile(r"ibm\.com/docs/en/([^/]+)/([^/\s?#]+)")
 
-# 等待 JS 渲染完成的秒數（IBM Docs 通常 3~5 秒）
-_JS_WAIT = 4.0
+# 等待 JS 渲染的最高逾時秒數（若主文提早出現則立刻返回，通常 < 1.0 秒）
+_JS_MAX_WAIT = 3.5
 
 # 頁面骨架（導覽殼）的開頭特徵：IBM Docs 是單頁應用，內容尚未渲染完成時，
 # 主文選擇器抓不到任何東西，退回整個 body 就會得到這段導覽文字而不是主文。
 _SKELETON_PREFIX = "Documentation\nMy IBM\nLog in"
-# 偵測到「主文尚未出現」時的補救：先多等一會兒重讀，再重新載入一次，仍失敗才放棄
-_EMPTY_CONTENT_EXTRA_WAIT = 8.0
+# 偵測到「主文尚未出現」時的快速補救重試等待秒數
+_EMPTY_CONTENT_EXTRA_WAIT = 1.5
 
 # 沒有主文的頁面（版本首頁／landing page）只有目錄連結。範圍內連結達此數量才視為
 # landing page：不寫入 chunk，但記錄為已完成並用它的連結展開佇列。
@@ -145,6 +149,11 @@ def _make_driver(isolated: bool = False):
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    # 禁用圖片載入以大幅減少頻寬與渲染開銷
+    options.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    })
     options.add_argument(
         "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -168,6 +177,20 @@ def _make_driver(isolated: bool = False):
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
         )
+        # 透過 CDP 阻擋字型、多媒體與第三方追蹤請求
+        try:
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                "urls": [
+                    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.webp", "*.ico",
+                    "*.woff", "*.woff2", "*.ttf", "*.eot", "*.otf",
+                    "*.mp4", "*.webm", "*.mp3",
+                    "*analytics*", "*optimizely*", "*doubleclick*", "*google-analytics*",
+                    "*tealium*", "*adobe*", "*demdex*", "*hotjar*"
+                ]
+            })
+            driver.execute_cdp_cmd("Network.enable", {})
+        except Exception:
+            pass
     except Exception:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -185,7 +208,13 @@ def _load_with_retry(url: str, driver) -> bool:
     for attempt in range(_MAX_RETRIES + 1):
         try:
             driver.get(url)
-            time.sleep(_JS_WAIT)  # 等待 JS 渲染完成
+            # 顯式等待主文出現（若 0.5 秒即出現則 0.5 秒返回，最多等 _JS_MAX_WAIT 秒）
+            try:
+                WebDriverWait(driver, _JS_MAX_WAIT, poll_frequency=0.2).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, _CONTENT_CSS_JOINED))
+                )
+            except Exception:
+                pass
             return True
         except Exception as e:
             # 只取錯誤訊息第一行，避免印出整段 Stacktrace
